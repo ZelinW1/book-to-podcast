@@ -99,7 +99,10 @@ def main() -> None:
     parser.add_argument("--voice", action="append", default=[], metavar="ROLE=VOICE")
     parser.add_argument("--max-chars", type=int, default=120)
     parser.add_argument("--pause", type=float, default=0.25)
-    parser.add_argument("--seed", type=int)
+    parser.add_argument("--instruct", help="repeat the same delivery instruction for every segment")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--stochastic", action="store_true", help="enable sampling; deterministic synthesis is the default")
+    parser.add_argument("--no-loudness-match", action="store_true")
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--ffmpeg")
     parser.add_argument("--dry-run", action="store_true")
@@ -108,6 +111,11 @@ def main() -> None:
         parser.error("--max-chars must be at least 20 and --pause cannot be negative")
     title, script_language, turns = read_script(args.script)
     language = args.language or script_language or "Auto"
+    instruct = args.instruct if args.instruct is not None else (
+        "请用自然、平稳、清晰的播客旁白语气朗读，保持一致的音色和语速。"
+        if language.casefold() in {"chinese", "zh", "zh-cn"}
+        else "Read with a natural, steady, clear podcast narration style. Keep a consistent voice and pace."
+    )
     voices: dict[str, str] = {}
     for mapping in args.voice:
         if "=" not in mapping:
@@ -144,7 +152,7 @@ def main() -> None:
     cache = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
     pending = []
     for piece in pieces:
-        key = hashlib.sha256(json.dumps([str(args.model.resolve()), language, piece["voice"], piece["text"], args.seed, args.max_new_tokens], ensure_ascii=False).encode()).hexdigest()
+        key = hashlib.sha256(json.dumps([str(args.model.resolve()), language, piece["voice"], piece["text"], instruct, args.seed, args.stochastic, args.max_new_tokens], ensure_ascii=False).encode()).hexdigest()
         piece["cache_key"] = key
         if cache.get(piece["id"], {}).get("key") != key or not (segment_dir / f"{piece['id']}.wav").exists():
             pending.append(piece)
@@ -164,35 +172,49 @@ def main() -> None:
     for index, piece in enumerate(pieces):
         if piece not in pending:
             continue
-        if args.seed is not None:
-            torch.manual_seed(args.seed + index)
+        torch.manual_seed(args.seed)
         print(f"synthesizing {piece['id']} ({len(piece['text'])} chars)", flush=True)
-        wavs, sr = model.generate_custom_voice(text=piece["text"], speaker=piece["voice"], language=language, max_new_tokens=args.max_new_tokens)
+        wavs, sr = model.generate_custom_voice(text=piece["text"], speaker=piece["voice"], language=language, instruct=instruct, do_sample=args.stochastic, subtalker_dosample=args.stochastic, max_new_tokens=args.max_new_tokens)
         if sr != 24000:
             raise ValueError(f"unexpected Qwen sample rate: {sr}")
         sf.write(segment_dir / f"{piece['id']}.wav", wavs[0], sr, subtype="PCM_16")
         cache[piece["id"]] = {"key": piece["cache_key"]}
         cache_path.write_text(json.dumps(cache, indent=2) + "\n", encoding="utf-8")
         print(f"synthesized {piece['id']} ({len(piece['text'])} chars)", flush=True)
-    audio_parts = []
-    timing = []
-    cursor = 0.0
-    sample_rate = 24000
-    for index, piece in enumerate(pieces):
+    active_rms = []
+    for piece in pieces:
         waveform, sr = sf.read(segment_dir / f"{piece['id']}.wav", dtype="float32", always_2d=False)
-        if sr != sample_rate:
+        if sr != 24000:
             raise ValueError(f"sample-rate mismatch in {piece['id']}")
         if waveform.ndim == 2:
             waveform = waveform.mean(axis=1)
-        duration = len(waveform) / sample_rate
-        timing.append({key: piece[key] for key in ("id", "turn", "role", "voice", "source", "text") } | {"start": round(cursor, 3), "end": round(cursor + duration, 3)})
-        audio_parts.append(waveform)
-        cursor += duration
-        if index + 1 < len(pieces):
-            silence = np.zeros(round(args.pause * sample_rate), dtype="float32")
-            audio_parts.append(silence)
-            cursor += len(silence) / sample_rate
-    sf.write(output / "episode.wav", np.concatenate(audio_parts), sample_rate, subtype="PCM_16")
+        active = waveform[np.abs(waveform) > 0.005]
+        active_rms.append(float(np.sqrt(np.mean(active * active))) if len(active) else 0.0)
+    nonzero = [level for level in active_rms if level > 0]
+    target_rms = float(np.median(nonzero)) if nonzero else 0.0
+    timing = []
+    cursor = 0.0
+    sample_rate = 24000
+    with sf.SoundFile(output / "episode.wav", mode="w", samplerate=sample_rate, channels=1, subtype="PCM_16") as combined:
+        for index, piece in enumerate(pieces):
+            waveform, _ = sf.read(segment_dir / f"{piece['id']}.wav", dtype="float32", always_2d=False)
+            if waveform.ndim == 2:
+                waveform = waveform.mean(axis=1)
+            gain = 1.0
+            if not args.no_loudness_match and active_rms[index] and target_rms:
+                gain = float(np.clip(target_rms / active_rms[index], 0.67, 1.5))
+                peak = float(np.max(np.abs(waveform))) if len(waveform) else 0.0
+                if peak:
+                    gain = min(gain, 0.98 / peak)
+                waveform = waveform * gain
+            duration = len(waveform) / sample_rate
+            timing.append({key: piece[key] for key in ("id", "turn", "role", "voice", "source", "text") } | {"start": round(cursor, 3), "end": round(cursor + duration, 3), "gain_db": round(20 * np.log10(gain), 2)})
+            combined.write(waveform)
+            cursor += duration
+            if index + 1 < len(pieces):
+                silence = np.zeros(round(args.pause * sample_rate), dtype="float32")
+                combined.write(silence)
+                cursor += len(silence) / sample_rate
     (output / "timing.json").write_text(json.dumps({"schema": 1, "title": title, "language": language, "sample_rate": sample_rate, "duration": round(cursor, 3), "segments": timing}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     write_srt(output / "subtitles.srt", timing)
     ffmpeg = args.ffmpeg or shutil.which("ffmpeg")
