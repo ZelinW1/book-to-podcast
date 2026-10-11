@@ -143,7 +143,7 @@ def main() -> None:
     parser.add_argument("--audio", type=Path, required=True)
     parser.add_argument("--timing", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--font", type=Path, default=Path("C:/Windows/Fonts/msyh.ttc"))
+    parser.add_argument("--font", type=Path, required=True, help="font file with glyphs for the episode language")
     parser.add_argument("--width", type=int, default=1920)
     parser.add_argument("--height", type=int, default=1080)
     parser.add_argument("--fps", type=int, default=2, help="distinct drawn frames per second; encoder outputs 30 fps")

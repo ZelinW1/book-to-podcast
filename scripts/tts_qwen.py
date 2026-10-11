@@ -95,7 +95,7 @@ def main() -> None:
     parser.add_argument("--model", type=Path, default=os.environ.get("QWEN3_TTS_MODEL"))
     parser.add_argument("--language")
     parser.add_argument("--book-manifest", type=Path, help="validate source chunk IDs against book.json")
-    parser.add_argument("--default-voice", default="Serena")
+    parser.add_argument("--default-voice", help="voice for roles without an explicit --voice mapping")
     parser.add_argument("--voice", action="append", default=[], metavar="ROLE=VOICE")
     parser.add_argument("--max-chars", type=int, default=120)
     parser.add_argument("--pause", type=float, default=0.25)
@@ -125,6 +125,8 @@ def main() -> None:
     roles = {turn["role"] for turn in turns}
     if len(roles) > 1 and (any(role not in voices for role in roles) or len({voices[role] for role in roles}) < len(roles)):
         parser.error("multiple speaker roles need distinct --voice ROLE=VOICE mappings")
+    if any(role not in voices for role in roles) and not args.default_voice:
+        parser.error("set --default-voice or map every role with --voice ROLE=VOICE")
     pieces: list[dict] = []
     for turn_index, turn in enumerate(turns, 1):
         for spoken in split_speech(turn["text"], args.max_chars):
