@@ -217,8 +217,8 @@ def main() -> None:
                 silence = np.zeros(round(args.pause * sample_rate), dtype="float32")
                 combined.write(silence)
                 cursor += len(silence) / sample_rate
-    (output / "timing.json").write_text(json.dumps({"schema": 1, "title": title, "language": language, "sample_rate": sample_rate, "duration": round(cursor, 3), "segments": timing}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    write_srt(output / "subtitles.srt", timing)
+    (output / "timing.json").write_text(json.dumps({"schema": 1, "timing_kind": "synthesis_segments", "title": title, "language": language, "sample_rate": sample_rate, "duration": round(cursor, 3), "segments": timing}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    write_srt(output / "segment-cues.srt", timing)
     ffmpeg = args.ffmpeg or shutil.which("ffmpeg")
     if ffmpeg:
         subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", str(output / "episode.wav"), "-codec:a", "libmp3lame", "-qscale:a", "2", str(output / "episode.mp3")], check=True)

@@ -12,6 +12,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from ingest_book import chunks_of, read_epub
 from tts_qwen import read_script, split_speech
 
+try:
+    from render_video import parse_subtitles
+except ModuleNotFoundError as error:
+    if error.name != "PIL":
+        raise
+    parse_subtitles = None
+
 
 class IngestTests(unittest.TestCase):
     def test_epub_uses_spine_not_archive_order(self):
@@ -43,6 +50,23 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual((title, language), ("Title", "Chinese"))
         self.assertEqual(turns[0]["source"], ["c0001", "c0002"])
         self.assertEqual("".join(split_speech(turns[0]["text"], 20)).replace(" ", ""), turns[0]["text"].replace(" ", ""))
+
+
+@unittest.skipIf(parse_subtitles is None, "Pillow is optional for video rendering")
+class SubtitleTests(unittest.TestCase):
+    def test_aligned_srt_has_independent_cues(self):
+        path = Mock(spec=Path)
+        path.read_text.return_value = "1\n00:00:01,000 --> 00:00:02,500\n第一句\n\n2\n00:00:03,000 --> 00:00:04,000\n第二句\n"
+        self.assertEqual(parse_subtitles(path), [
+            {"start": 1.0, "end": 2.5, "text": "第一句"},
+            {"start": 3.0, "end": 4.0, "text": "第二句"},
+        ])
+
+    def test_overlapping_cues_are_rejected(self):
+        path = Mock(spec=Path)
+        path.read_text.return_value = "1\n00:00:01,000 --> 00:00:03,000\n第一句\n\n2\n00:00:02,000 --> 00:00:04,000\n第二句\n"
+        with self.assertRaises(ValueError):
+            parse_subtitles(path)
 
 
 if __name__ == "__main__":

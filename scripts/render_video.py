@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import shutil
 import subprocess
 import wave
@@ -15,21 +16,34 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 
-def timestamp(seconds: float) -> str:
-    millis = round(seconds * 1000)
-    hours, rest = divmod(millis, 3_600_000)
-    minutes, rest = divmod(rest, 60_000)
-    whole, millis = divmod(rest, 1000)
-    return f"{hours:02d}:{minutes:02d}:{whole:02d},{millis:03d}"
+def parse_subtitles(path: Path) -> list[dict]:
+    """Read an already aligned SRT; synthesis segment timings are not captions."""
+    def seconds(value: str) -> float:
+        match = re.fullmatch(r"(\d{2}):(\d{2}):(\d{2})[,\.](\d{3})", value)
+        if not match:
+            raise ValueError(f"invalid SRT timestamp: {value}")
+        hours, minutes, whole, millis = map(int, match.groups())
+        if minutes >= 60 or whole >= 60:
+            raise ValueError(f"invalid SRT timestamp: {value}")
+        return hours * 3600 + minutes * 60 + whole + millis / 1000
 
-
-def make_subtitles(path: Path, segments: list[dict], end: float) -> None:
-    lines = []
-    for index, segment in enumerate(segments, 1):
-        if segment["start"] >= end:
-            break
-        lines.extend([str(index), f"{timestamp(segment['start'])} --> {timestamp(min(segment['end'], end))}", segment["text"], ""])
-    path.write_text("\n".join(lines), encoding="utf-8")
+    blocks = re.split(r"\n\s*\n", path.read_text(encoding="utf-8-sig").replace("\r\n", "\n").strip())
+    cues: list[dict] = []
+    for block in blocks:
+        lines = block.splitlines()
+        if lines and lines[0].strip().isdigit():
+            lines = lines[1:]
+        if len(lines) < 2 or " --> " not in lines[0]:
+            raise ValueError(f"invalid SRT cue in {path}")
+        start_text, end_text = lines[0].split(" --> ", 1)
+        start, end = seconds(start_text.strip()), seconds(end_text.strip())
+        caption = "\n".join(line.strip() for line in lines[1:]).strip()
+        if not caption or end <= start or (cues and start < cues[-1]["end"]):
+            raise ValueError(f"empty, reversed, or overlapping SRT cue in {path}")
+        cues.append({"start": start, "end": end, "text": caption})
+    if not cues:
+        raise ValueError(f"no SRT cues in {path}")
+    return cues
 
 
 def load_rms(path: Path, seconds: float, fps: int) -> list[float]:
@@ -61,7 +75,7 @@ def font(path: Path, size: int) -> ImageFont.FreeTypeFont:
     return ImageFont.truetype(str(path), size)
 
 
-def wrap_text(draw: ImageDraw.ImageDraw, text: str, face: ImageFont.FreeTypeFont, width: int, max_lines: int) -> list[str]:
+def wrap_text(draw: ImageDraw.ImageDraw, text: str, face: ImageFont.FreeTypeFont, width: int, max_lines: int, truncate: bool = True) -> list[str]:
     lines: list[str] = []
     current = ""
     for char in text:
@@ -78,9 +92,20 @@ def wrap_text(draw: ImageDraw.ImageDraw, text: str, face: ImageFont.FreeTypeFont
     if current:
         lines.append(current)
     if len(lines) > max_lines:
+        if not truncate:
+            raise ValueError("subtitle cue is too long for the caption panel; split and align it before rendering")
         lines = lines[:max_lines]
         lines[-1] = lines[-1].rstrip("，。；,. ") + "…"
     return lines
+
+
+def validate_caption_fit(captions: list[dict], width: int, height: int, font_path: Path) -> None:
+    scale = min(width / 1920, height / 1080)
+    margin = round(112 * scale)
+    face = font(font_path, max(27, round(51 * scale)))
+    draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    for cue in captions:
+        wrap_text(draw, cue["text"], face, width - 2 * margin - round(90 * scale), 3, truncate=False)
 
 
 def current_segment(segments: list[dict], time: float) -> dict | None:
@@ -94,7 +119,7 @@ def current_segment(segments: list[dict], time: float) -> dict | None:
     return segments[low] if low < len(segments) and segments[low]["start"] <= time else None
 
 
-def draw_frame(width: int, height: int, time: float, duration: float, title: str, segments: list[dict], rms: list[float], fps: int, font_path: Path) -> Image.Image:
+def draw_frame(width: int, height: int, time: float, duration: float, title: str, segments: list[dict], captions: list[dict], rms: list[float], fps: int, font_path: Path) -> Image.Image:
     scale = min(width / 1920, height / 1080)
     image = Image.new("RGB", (width, height), (13, 22, 36))
     draw = ImageDraw.Draw(image)
@@ -112,17 +137,19 @@ def draw_frame(width: int, height: int, time: float, duration: float, title: str
     for line in title_lines:
         draw.text((margin, y), line, font=title_font, fill=white)
         y += round(101 * scale)
-    current = current_segment(segments, time)
-    panel_top = round(535 * scale)
-    panel_bottom = round(910 * scale)
-    draw.rounded_rectangle((margin, panel_top, width - margin, panel_bottom), radius=round(27 * scale), fill=(24, 38, 53))
-    role = current["role"] if current else ""
-    speech = current["text"] if current else ""
-    if role:
-        draw.text((margin + round(45 * scale), panel_top + round(40 * scale)), role, font=label_font, fill=accent)
-    caption_lines = wrap_text(draw, speech, caption_font, width - 2 * margin - round(90 * scale), 3)
-    for line_number, line in enumerate(caption_lines):
-        draw.text((margin + round(45 * scale), panel_top + round((105 + 75 * line_number) * scale)), line, font=caption_font, fill=white)
+    if captions:
+        current = current_segment(segments, time)
+        panel_top = round(535 * scale)
+        panel_bottom = round(910 * scale)
+        draw.rounded_rectangle((margin, panel_top, width - margin, panel_bottom), radius=round(27 * scale), fill=(24, 38, 53))
+        role = current["role"] if current else ""
+        current_caption = current_segment(captions, time)
+        speech = current_caption["text"] if current_caption else ""
+        if role:
+            draw.text((margin + round(45 * scale), panel_top + round(40 * scale)), role, font=label_font, fill=accent)
+        caption_lines = wrap_text(draw, speech, caption_font, width - 2 * margin - round(90 * scale), 3, truncate=False)
+        for line_number, line in enumerate(caption_lines):
+            draw.text((margin + round(45 * scale), panel_top + round((105 + 75 * line_number) * scale)), line, font=caption_font, fill=white)
     bar_y = round(972 * scale)
     draw.rounded_rectangle((margin, bar_y, width - margin, bar_y + round(8 * scale)), radius=4, fill=(62, 82, 95))
     progress = min(1, max(0, time / duration)) if duration else 0
@@ -142,6 +169,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--audio", type=Path, required=True)
     parser.add_argument("--timing", type=Path, required=True)
+    parser.add_argument("--subtitles", type=Path, help="verified SRT aligned to the final audio; without it the starter draws no speech captions")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--font", type=Path, required=True, help="font file with glyphs for the episode language")
     parser.add_argument("--width", type=int, default=1920)
@@ -153,7 +181,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.width < 640 or args.height < 360 or args.width % 2 or args.height % 2 or args.fps < 1:
         parser.error("width and height must be even and at least 640x360; fps must be positive")
-    if not args.audio.is_file() or not args.timing.is_file() or not args.font.is_file():
+    if not args.audio.is_file() or not args.timing.is_file() or not args.font.is_file() or (args.subtitles and not args.subtitles.is_file()):
         parser.error("audio, timing, and font must exist")
     timeline = json.loads(args.timing.read_text(encoding="utf-8"))
     duration = float(timeline["duration"])
@@ -162,16 +190,23 @@ def main() -> None:
     if duration <= 0:
         parser.error("episode duration must be positive")
     segments = timeline["segments"]
+    if args.subtitles and args.subtitles.name.casefold() == "segment-cues.srt":
+        parser.error("segment-cues.srt is synthesis timing, not aligned subtitles")
+    captions = parse_subtitles(args.subtitles) if args.subtitles else []
+    if captions and captions[-1]["end"] > float(timeline["duration"]) + 0.05:
+        parser.error("subtitle cues extend past the full audio duration")
+    validate_caption_fit(captions, args.width, args.height, args.font)
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     renderer_copy = output / "render_video.py"
     if Path(__file__).resolve() != renderer_copy.resolve():
         shutil.copy2(Path(__file__).resolve(), renderer_copy)
-    project = {"schema": 1, "audio": str(args.audio.resolve()), "timing": str(args.timing.resolve()), "renderer": str(renderer_copy), "font": str(args.font.resolve()), "width": args.width, "height": args.height, "draw_fps": args.fps, "duration": duration, "title": timeline["title"]}
+    project = {"schema": 1, "audio": str(args.audio.resolve()), "timing": str(args.timing.resolve()), "subtitles": str(args.subtitles.resolve()) if args.subtitles else None, "renderer": str(renderer_copy), "font": str(args.font.resolve()), "width": args.width, "height": args.height, "draw_fps": args.fps, "duration": duration, "title": timeline["title"]}
     (output / "video-project.json").write_text(json.dumps(project, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    make_subtitles(output / "subtitles.srt", segments, duration)
+    if args.subtitles and args.subtitles.resolve() != (output / "subtitles.srt").resolve():
+        shutil.copy2(args.subtitles, output / "subtitles.srt")
     rms = load_rms(args.audio, duration, args.fps)
-    image = draw_frame(args.width, args.height, 0, duration, timeline["title"], segments, rms, args.fps, args.font)
+    image = draw_frame(args.width, args.height, 0, duration, timeline["title"], segments, captions, rms, args.fps, args.font)
     image.save(output / "preview.png")
     if args.preview_only:
         print(str(output / "preview.png"))
@@ -185,7 +220,7 @@ def main() -> None:
         assert process.stdin is not None
         for frame_number in range(frame_count):
             t = frame_number / args.fps
-            frame = draw_frame(args.width, args.height, t, duration, timeline["title"], segments, rms, args.fps, args.font)
+            frame = draw_frame(args.width, args.height, t, duration, timeline["title"], segments, captions, rms, args.fps, args.font)
             process.stdin.write(frame.tobytes())
         process.stdin.close()
         if process.wait() != 0:
